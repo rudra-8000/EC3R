@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>eReader File Manager</title>
+<style>
+  body{font-family:sans-serif;max-width:520px;margin:20px auto;padding:0 12px;background:#f5f5f5}
+  h1{font-size:1.3rem;color:#333}
+  .card{background:#fff;border-radius:8px;padding:14px;margin-bottom:14px;box-shadow:0 1px 4px #0002}
+  table{width:100%;border-collapse:collapse}
+  td,th{padding:6px 8px;text-align:left;font-size:0.85rem}
+  th{background:#eee}
+  tr:nth-child(even){background:#f9f9f9}
+  button{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:0.82rem}
+  .del{background:#e74c3c;color:#fff}
+  .del:hover{background:#c0392b}
+  #uploadBtn{background:#27ae60;color:#fff;padding:8px 18px;font-size:0.9rem}
+  #uploadBtn:hover{background:#219150}
+  progress{width:100%;height:10px;margin-top:6px}
+  #msg{margin-top:6px;font-size:0.82rem;color:#555}
+  .space{font-size:0.8rem;color:#777}
+  #rebootBtn{background:#e67e22;color:#fff}
+</style>
+</head>
+<body>
+<h1>📖 eReader File Manager</h1>
+
+<div class="card">
+  <b>Upload EPUB</b><br><br>
+  <input type="file" id="fileInput" accept=".epub" multiple>
+  <br><br>
+  <button id="uploadBtn" onclick="uploadFiles()">Upload</button>
+  <progress id="prog" value="0" max="100" style="display:none"></progress>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <b>Books on device</b>
+  <span id="spaceInfo" class="space"></span>
+  <table>
+    <thead><tr><th>Filename</th><th>Size</th><th></th></tr></thead>
+    <tbody id="bookList"><tr><td colspan="3">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card" style="display:flex;gap:10px;align-items:center">
+  <button id="rebootBtn" onclick="reboot()">Reboot Device</button>
+  <span style="font-size:0.8rem;color:#888">Reboot to refresh book list on device</span>
+</div>
+
+<script>
+function fmt(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(2)+'MB';}
+
+async function loadList(){
+  try{
+    const [lr, sr] = await Promise.all([fetch('/list'), fetch('/space')]);
+    const books = await lr.json();
+    const space = await sr.json();
+    document.getElementById('spaceInfo').textContent =
+      ` — ${fmt(space.used)} / ${fmt(space.total)} used`;
+    const tbody = document.getElementById('bookList');
+    if(!books.length){tbody.innerHTML='<tr><td colspan="3">No books yet</td></tr>';return;}
+    tbody.innerHTML = books.map(b=>`
+      <tr>
+        <td>${b.name}</td>
+        <td>${fmt(b.size)}</td>
+        <td><button class="del" onclick="del('${b.name}')">Delete</button></td>
+      </tr>`).join('');
+  }catch(e){document.getElementById('bookList').innerHTML='<tr><td colspan="3">Error loading</td></tr>';}
+}
+
+async function del(name){
+  if(!confirm('Delete '+name+'?'))return;
+  await fetch('/delete?f='+encodeURIComponent(name));
+  loadList();
+}
+
+function uploadFiles(){
+  const files = document.getElementById('fileInput').files;
+  if(!files.length){alert('Select EPUB file(s) first');return;}
+  let i=0;
+  const msg=document.getElementById('msg');
+  const prog=document.getElementById('prog');
+  prog.style.display='block';
+  function next(){
+    if(i>=files.length){msg.textContent='Done! Reboot device to refresh book list.';prog.style.display='none';loadList();return;}
+    const f=files[i++];
+    msg.textContent=`Uploading ${f.name}…`;
+    const fd=new FormData(); fd.append('file',f,f.name);
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST','/upload');
+    xhr.upload.onprogress=e=>{if(e.lengthComputable)prog.value=Math.round(e.loaded/e.total*100);};
+    xhr.onload=()=>{prog.value=0;next();};
+    xhr.onerror=()=>{msg.textContent='Upload failed for '+f.name;prog.style.display='none';};
+    xhr.send(fd);
+  }
+  next();
+}
+
+async function reboot(){
+  if(confirm('Reboot device?')){await fetch('/reboot');document.getElementById('msg').textContent='Rebooting…';}
+}
+
+loadList();
+</script>
+</body>
+</html>
