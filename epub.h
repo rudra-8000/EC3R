@@ -158,6 +158,18 @@ static int stripHtml(const char* html, int len,
   bool gotImg = false;
   static char tag[256];
 
+  // HTML entity table — every entry is exactly one char
+  static const char* const es[] = {
+    "&amp;", "&lt;", "&gt;", "&nbsp;", "&#160;",
+    "&apos;", "&quot;", "&mdash;", "&ndash;",
+    "&ldquo;", "&rdquo;", "&lsquo;", "&rsquo;"
+  };
+  static const char ec[] = {
+    '&', '<', '>', ' ', ' ',
+    '\'', '"', '-', '-',
+    '"', '"', '\'', '\''
+  };
+
   while (p < end && oi < outLen - 1) {
     if (!inTag) {
       if (*p == '<') {
@@ -171,8 +183,8 @@ static int stripHtml(const char* html, int len,
           }
         }
         if (p + 2 < end) {
-          const char* blk[]={
-            "p ","p>","br","h1","h2","h3","h4","h5","h6","li","/p","tr"};
+          const char* blk[]={"p ","p>","br","h1","h2","h3",
+                              "h4","h5","h6","li","/p","tr"};
           for (int bi=0;bi<12;bi++)
             if(strncasecmp(p+1,blk[bi],2)==0){
               if(oi>0&&out[oi-1]!='\n') out[oi++]='\n';
@@ -182,15 +194,12 @@ static int stripHtml(const char* html, int len,
         p++; continue;
       }
       if (*p == '&') {
-        const char* es[]={"&amp;","&lt;","&gt;","&nbsp;","&#160;",
-                           "&apos;","&quot;","&mdash;","&ndash;",
-                           "&ldquo;","&rdquo;","&lsquo;","&rsquo;"};
-        const char  ec[]={'&','<','>',     ' ',    ' ',
-                          '\'','"',  '-',    '-','"','"','\'',' \''};
         bool matched=false;
         for(int ei=0;ei<13;ei++){
           int el=strlen(es[ei]);
-          if(strncasecmp(p,es[ei],el)==0){out[oi++]=ec[ei];p+=el;matched=true;break;}
+          if(strncasecmp(p,es[ei],el)==0){
+            out[oi++]=ec[ei]; p+=el; matched=true; break;
+          }
         }
         if(!matched) out[oi++]=*p++;
         continue;
