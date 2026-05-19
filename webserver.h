@@ -3,7 +3,7 @@
  * Async web file manager — fully self-contained, no LittleFS HTML file needed.
  * Routes:
  *   GET  /          → inline file manager SPA
- *   GET  /list      → JSON array of books
+ *   GET  /list      → JSON array of books  {name, size}
  *   POST /upload    → multipart upload → /books/<filename>
  *   GET  /delete?f= → delete a book
  *   GET  /space     → disk usage JSON
@@ -87,15 +87,20 @@ function loadBooks(){
       tb.innerHTML = '<tr><td colspan="3" class="empty">No books uploaded yet.</td></tr>';
       return;
     }
-    tb.innerHTML = books.map(function(b){
-      return '<tr><td>'+b.name+'</td><td>'+fmt(b.size)+'</td><td>'+
-             '<button class="del" onclick="del(\'' + b.name + '\')">Delete</button></td></tr>';
-    }).join('');
+    var rows = '';
+    for(var i=0;i<books.length;i++){
+      var b = books[i];
+      rows += '<tr><td>'+b.name+'</td><td>'+fmt(b.size)+'</td><td>';
+      rows += '<button class="del" onclick="del(this,\'' + b.name + '\')">Delete</button>';
+      rows += '</td></tr>';
+    }
+    tb.innerHTML = rows;
   });
 }
 
-function del(name){
+function del(btn, name){
   if(!confirm('Delete '+name+'?')) return;
+  btn.disabled = true;
   fetch('/delete?f='+encodeURIComponent(name)).then(function(){
     loadBooks(); loadSpace();
   });
@@ -104,7 +109,7 @@ function del(name){
 function reboot(){
   if(!confirm('Reboot device?')) return;
   fetch('/reboot').then(function(){
-    document.getElementById('status').textContent = 'Rebooting...';
+    document.getElementById('status').textContent = 'Rebooting... reconnect in a few seconds.';
   });
 }
 
@@ -118,12 +123,12 @@ function uploadFiles(files){
   function next(){
     if(i >= files.length){
       loadBooks(); loadSpace();
-      status.textContent = 'Upload complete!';
+      status.textContent = 'All uploads complete!';
       progressDiv.style.display = 'none';
       return;
     }
     var f = files[i++];
-    status.textContent = 'Uploading '+f.name+'...';
+    status.textContent = 'Uploading '+f.name+' ('+fmt(f.size)+')';
     var fd = new FormData();
     fd.append('file', f, f.name);
     var xhr = new XMLHttpRequest();
@@ -134,7 +139,8 @@ function uploadFiles(files){
     xhr.onload = function(){ prog.value=0; next(); };
     xhr.onerror = function(){
       status.textContent = 'Error uploading '+f.name;
-      prog.value = 0; next();
+      prog.value = 0;
+      setTimeout(next, 1000);
     };
     xhr.send(fd);
   }
@@ -164,29 +170,40 @@ inline void webServerInit() {
     req->send_P(200, "text/html", INDEX_HTML);
   });
 
+  // List books — re-open each file to get accurate size
   _srv.on("/list", HTTP_GET, [](AsyncWebServerRequest* req) {
     String json = "[";
-    File root = LittleFS.open("/books");
     bool first = true;
+    File root = LittleFS.open("/books");
     if (root && root.isDirectory()) {
-      File f = root.openNextFile();
-      while (f) {
-        if (!f.isDirectory()) {
+      File entry = root.openNextFile();
+      while (entry) {
+        if (!entry.isDirectory()) {
+          String fullPath = String("/books/") + entry.name();
+          // entry.name() may already be the full path on some ESP32 versions
+          String nm = entry.name();
+          int ls = nm.lastIndexOf('/');
+          if (ls >= 0) {
+            fullPath = nm;  // already full path
+            nm = nm.substring(ls + 1);
+          }
+          size_t sz = entry.size();
+          entry.close();
+          // Re-open for accurate flushed size
+          File f2 = LittleFS.open(fullPath, "r");
+          if (f2) { sz = f2.size(); f2.close(); }
           if (!first) json += ",";
-          json += "{\"name\":\"";
-          json += String(f.name());
-          json += "\",\"size\":";
-          json += f.size();
-          json += "}";
+          json += "{\"name\":\"" + nm + "\",\"size\":" + sz + "}";
           first = false;
         }
-        f = root.openNextFile();
+        entry = root.openNextFile();
       }
     }
     json += "]";
     req->send(200, "application/json", json);
   });
 
+  // Upload handler
   _srv.on("/upload", HTTP_POST,
     [](AsyncWebServerRequest* req) {
       req->send(200, "text/plain", "OK");
@@ -195,21 +212,34 @@ inline void webServerInit() {
        size_t index, uint8_t* data, size_t len, bool final) {
       static File _upFile;
       if (index == 0) {
+        // filename is the bare browser filename
         String fn = filename;
-        fn.replace("/", "_");
+        // Strip any path separators the browser might send
+        int ls = fn.lastIndexOf('/');
+        if (ls >= 0) fn = fn.substring(ls + 1);
+        ls = fn.lastIndexOf('\\');
+        if (ls >= 0) fn = fn.substring(ls + 1);
         String path = "/books/" + fn;
-        Serial.printf("[Upload] %s\n", path.c_str());
+        Serial.printf("[Upload] opening %s\n", path.c_str());
         _upFile = LittleFS.open(path, "w");
+        if (!_upFile) Serial.println("[Upload] ERROR: could not open file for write");
       }
-      if (_upFile) _upFile.write(data, len);
-      if (final && _upFile) { _upFile.close(); Serial.println("[Upload] Done"); }
+      if (_upFile && len > 0) _upFile.write(data, len);
+      if (final) {
+        if (_upFile) {
+          _upFile.flush();
+          Serial.printf("[Upload] Done: %u bytes\n", (unsigned)_upFile.size());
+          _upFile.close();
+        }
+      }
     }
   );
 
   _srv.on("/delete", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (req->hasParam("f")) {
       String fn = req->getParam("f")->value();
-      fn.replace("/", "_");
+      int ls = fn.lastIndexOf('/');
+      if (ls >= 0) fn = fn.substring(ls + 1);
       LittleFS.remove("/books/" + fn);
       req->send(200, "text/plain", "Deleted");
     } else {
@@ -220,7 +250,7 @@ inline void webServerInit() {
   _srv.on("/space", HTTP_GET, [](AsyncWebServerRequest* req) {
     size_t total = LittleFS.totalBytes();
     size_t used  = LittleFS.usedBytes();
-    size_t fr    = total - used;
+    size_t fr    = (used <= total) ? (total - used) : 0;
     char buf[80];
     snprintf(buf, sizeof(buf),
              "{\"total\":%lu,\"used\":%lu,\"free\":%lu}",
@@ -230,7 +260,7 @@ inline void webServerInit() {
 
   _srv.on("/reboot", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "text/plain", "Rebooting...");
-    delay(500); ESP.restart();
+    delay(300); ESP.restart();
   });
 
   _srv.begin();

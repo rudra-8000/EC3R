@@ -41,16 +41,25 @@ inline void loadBookState(AppState& s) {
   memset(&s.progress, 0, sizeof(s.progress));
 
   // Enumerate /books/*.epub
+  // On ESP32 LittleFS, entry.name() returns the FULL path e.g. "/books/foo.epub"
+  // We store only the bare filename so epubPath = "/books/" + name is correct.
   File root = LittleFS.open("/books");
   if (root && root.isDirectory()) {
     File entry = root.openNextFile();
     while (entry && s.bookCount < MAX_BOOKS) {
       if (!entry.isDirectory()) {
-        String n = entry.name();
-        n.toLowerCase();
-        if (n.endsWith(".epub")) {
-          // entry.name() on LittleFS returns just the filename, not full path
-          strncpy(s.books[s.bookCount], entry.name(), 63);
+        String fullName = entry.name();  // may be "/books/foo.epub" or "foo.epub"
+        // Strip leading directory component if present
+        int lastSlash = fullName.lastIndexOf('/');
+        String bareName = (lastSlash >= 0) ? fullName.substring(lastSlash + 1) : fullName;
+        bareName.toLowerCase();
+        if (bareName.endsWith(".epub")) {
+          // Store back without toLowerCase so filename is preserved
+          String orig = entry.name();
+          int ls = orig.lastIndexOf('/');
+          String origBare = (ls >= 0) ? orig.substring(ls + 1) : orig;
+          strncpy(s.books[s.bookCount], origBare.c_str(), 63);
+          s.books[s.bookCount][63] = '\0';
           s.bookCount++;
         }
       }
