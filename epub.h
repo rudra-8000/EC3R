@@ -1,7 +1,8 @@
 #pragma once
 /*
  * Minimal EPUB 2/3 parser.
- * All large buffers are static or heap-allocated — nothing large on stack.
+ * ALL large objects (ZipFile, buffers) are static — nothing large on stack.
+ * Not re-entrant, but fine for single-task embedded use.
  */
 #include <Arduino.h>
 #include "ZipFile.h"
@@ -17,22 +18,22 @@ struct EpubInfo {
   bool valid;
 };
 
-// Tiny attribute extractor — small locals only, fine on stack
+// ---- Static instances ---------------------------------------------------
+// mz_zip_archive is ~1.4KB; declaring ZipFile on the stack overflows 8KB loopTask.
+static ZipFile _epubZip;   // used in epubOpen
+static ZipFile _epubZip2;  // used for image extraction in sesLoadChapter
+
+// ---- Attribute extractor ------------------------------------------------
 static bool _getAttr(const char* s, const char* attr, char* out, int outLen) {
-  // Build search strings inline to avoid 80-byte VLAs on stack
-  const char* p = s;
   int alen = strlen(attr);
+  const char* p = s;
   char close = '"';
-  // Search for attr="
   bool found = false;
   while (*p) {
     if (strncmp(p, attr, alen) == 0 && p[alen] == '=') {
       char q = p[alen + 1];
       if (q == '"' || q == '\'') {
-        close = q;
-        p += alen + 2;
-        found = true;
-        break;
+        close = q; p += alen + 2; found = true; break;
       }
     }
     p++;
@@ -46,10 +47,9 @@ static bool _getAttr(const char* s, const char* attr, char* out, int outLen) {
   return true;
 }
 
-// container.xml is tiny; 512B stack buf is safe here
-static bool _epubFindOpf(ZipFile& zip, char* opfPath) {
+static bool _epubFindOpf(char* opfPath) {
   static char buf[512];
-  size_t n = zip.extractSmall("META-INF/container.xml", buf, sizeof(buf) - 1);
+  size_t n = _epubZip.extractSmall("META-INF/container.xml", buf, sizeof(buf) - 1);
   if (!n) return false;
   buf[n] = '\0';
   char* p = buf;
@@ -62,47 +62,42 @@ static bool _epubFindOpf(ZipFile& zip, char* opfPath) {
   return false;
 }
 
-// All large parse buffers are static — not re-entrant but fine for single-task use
 inline bool epubOpen(const char* path, EpubInfo& info) {
   info.valid = false; info.chapterCount = 0;
 
-  ZipFile zip;
-  if (!zip.open(path)) {
+  if (!_epubZip.open(path)) {
     Serial.printf("[epub] zip.open failed: %s\n", path);
     return false;
   }
 
   static char opfPath[MAX_PATH_LEN];
-  if (!_epubFindOpf(zip, opfPath)) {
-    Serial.println("[epub] container.xml / rootfile not found");
-    zip.close(); return false;
+  if (!_epubFindOpf(opfPath)) {
+    Serial.println("[epub] container.xml not found");
+    _epubZip.close(); return false;
   }
   Serial.printf("[epub] OPF: %s\n", opfPath);
 
-  // Build opfBase
   strncpy(info.opfBase, opfPath, MAX_PATH_LEN - 1);
   info.opfBase[MAX_PATH_LEN - 1] = '\0';
   char* sl = strrchr(info.opfBase, '/');
   if (sl) *(sl + 1) = '\0'; else info.opfBase[0] = '\0';
 
-  // Read OPF into static heap-like buffer
   static char opf[8192];
-  size_t opfLen = zip.extractSmall(opfPath, opf, sizeof(opf) - 1);
-  zip.close();
+  size_t opfLen = _epubZip.extractSmall(opfPath, opf, sizeof(opf) - 1);
+  _epubZip.close();
   if (!opfLen) { Serial.println("[epub] OPF empty"); return false; }
   opf[opfLen] = '\0';
   Serial.printf("[epub] OPF len=%u\n", (unsigned)opfLen);
 
-  // Manifest: id → href  — static array, not on stack
   struct Item { char id[64]; char href[MAX_HREF_LEN]; };
   static Item manifest[MAX_CHAPTERS];
   int mCount = 0;
 
   char* p = opf;
+  static char media[64];
   while ((p = strstr(p, "<item ")) && mCount < MAX_CHAPTERS) {
     char* end = strchr(p, '>'); if (!end) break;
     char saved = *end; *end = '\0';
-    static char media[64];
     media[0] = '\0';
     _getAttr(p, "media-type", media, sizeof(media));
     if (strstr(media, "html")) {
@@ -112,20 +107,18 @@ inline bool epubOpen(const char* path, EpubInfo& info) {
     }
     *end = saved; p = end + 1;
   }
-  Serial.printf("[epub] manifest html items: %d\n", mCount);
+  Serial.printf("[epub] manifest items: %d\n", mCount);
 
-  // Spine
   char* spineS = strstr(opf, "<spine");
   char* spineE = strstr(opf, "</spine>");
-  if (!spineS || !spineE) { Serial.println("[epub] no <spine>"); return false; }
+  if (!spineS || !spineE) { Serial.println("[epub] no spine"); return false; }
 
   static char idref[64];
   static char decoded[MAX_HREF_LEN];
 
   p = spineS;
   while (p < spineE && info.chapterCount < MAX_CHAPTERS) {
-    p = strstr(p, "<itemref");
-    if (!p || p >= spineE) break;
+    p = strstr(p, "<itemref"); if (!p || p >= spineE) break;
     char* end = strchr(p, '>'); if (!end) break;
     char saved = *end; *end = '\0';
     idref[0] = '\0';
@@ -142,8 +135,8 @@ inline bool epubOpen(const char* path, EpubInfo& info) {
           } else { *dst++ = *src++; }
         }
         *dst = '\0';
-        snprintf(info.chapterHrefs[info.chapterCount],
-                 MAX_HREF_LEN, "%s%s", info.opfBase, decoded);
+        snprintf(info.chapterHrefs[info.chapterCount], MAX_HREF_LEN,
+                 "%s%s", info.opfBase, decoded);
         info.chapterCount++;
         break;
       }
@@ -151,73 +144,66 @@ inline bool epubOpen(const char* path, EpubInfo& info) {
     *end = saved; p = end + 1;
   }
 
-  Serial.printf("[epub] chapters in spine: %d\n", info.chapterCount);
+  Serial.printf("[epub] chapters: %d\n", info.chapterCount);
   info.valid = info.chapterCount > 0;
   return info.valid;
 }
 
-// HTML → plain text stripper — operates on caller-allocated buffers, no large locals
+// ---- HTML stripper -------------------------------------------------------
 static int stripHtml(const char* html, int len,
                      char* out, int outLen,
                      char* imgSrc, int imgSrcLen) {
   int oi = 0; bool inTag = false;
   const char* p = html, *end = html + len;
   bool gotImg = false;
-  static char tag[256];   // reuse across calls
+  static char tag[256];
 
   while (p < end && oi < outLen - 1) {
     if (!inTag) {
       if (*p == '<') {
         inTag = true;
-        if (!gotImg && imgSrc && p + 4 < end &&
-            strncasecmp(p + 1, "img ", 4) == 0) {
+        if (!gotImg && imgSrc && p + 4 < end && strncasecmp(p+1,"img ",4)==0) {
           const char* te = strchr(p, '>');
           if (te) {
-            int tl = (int)(te - p);
-            if (tl > 255) tl = 255;
-            strncpy(tag, p, tl); tag[tl] = '\0';
-            if (_getAttr(tag, "src", imgSrc, imgSrcLen)) gotImg = true;
+            int tl = (int)(te-p); if(tl>255)tl=255;
+            strncpy(tag,p,tl); tag[tl]='\0';
+            if(_getAttr(tag,"src",imgSrc,imgSrcLen)) gotImg=true;
           }
         }
         if (p + 2 < end) {
-          const char* blk[] = {"p ","p>","br","h1","h2","h3",
-                                "h4","h5","h6","li","/p","tr"};
-          for (int bi = 0; bi < 12; bi++) {
-            if (strncasecmp(p + 1, blk[bi], 2) == 0) {
-              if (oi > 0 && out[oi-1] != '\n') out[oi++] = '\n';
+          const char* blk[]={
+            "p ","p>","br","h1","h2","h3","h4","h5","h6","li","/p","tr"};
+          for (int bi=0;bi<12;bi++)
+            if(strncasecmp(p+1,blk[bi],2)==0){
+              if(oi>0&&out[oi-1]!='\n') out[oi++]='\n';
               break;
             }
-          }
         }
         p++; continue;
       }
       if (*p == '&') {
-        // Inline entity table — no struct on stack
-        const char* es[] = {"&amp;","&lt;","&gt;","&nbsp;","&#160;",
-                             "&apos;","&quot;","&mdash;","&ndash;",
-                             "&ldquo;","&rdquo;","&lsquo;","&rsquo;"};
-        const char  ec[]  = {'&','<','>',     ' ',    ' ',
-                             '\'','"',  '-',    '-',
-                             '"',   '"',   '\'',   '\''};
-        bool matched = false;
-        for (int ei = 0; ei < 13; ei++) {
-          int el = strlen(es[ei]);
-          if (strncasecmp(p, es[ei], el) == 0) {
-            out[oi++] = ec[ei]; p += el; matched = true; break;
-          }
+        const char* es[]={"&amp;","&lt;","&gt;","&nbsp;","&#160;",
+                           "&apos;","&quot;","&mdash;","&ndash;",
+                           "&ldquo;","&rdquo;","&lsquo;","&rsquo;"};
+        const char  ec[]={'&','<','>',     ' ',    ' ',
+                          '\'','"',  '-',    '-','"','"','\'',' \''};
+        bool matched=false;
+        for(int ei=0;ei<13;ei++){
+          int el=strlen(es[ei]);
+          if(strncasecmp(p,es[ei],el)==0){out[oi++]=ec[ei];p+=el;matched=true;break;}
         }
-        if (!matched) out[oi++] = *p++;
+        if(!matched) out[oi++]=*p++;
         continue;
       }
-      unsigned char c = (unsigned char)*p;
-      if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') { p++; continue; }
-      if (c > 0x7E) { p++; continue; }  // drop non-ASCII silently
-      out[oi++] = *p++;
+      unsigned char c=(unsigned char)*p;
+      if(c<0x20&&c!='\n'&&c!='\r'&&c!='\t'){p++;continue;}
+      if(c>0x7E){p++;continue;}
+      out[oi++]=*p++;
     } else {
-      if (*p == '>') inTag = false;
+      if(*p=='>') inTag=false;
       p++;
     }
   }
-  out[oi] = '\0';
+  out[oi]='\0';
   return oi;
 }
