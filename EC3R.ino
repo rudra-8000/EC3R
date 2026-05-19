@@ -24,12 +24,7 @@
 #include <WiFi.h>
 #include <ArduinoJson.h>
 
-// GxEPD2 — GDEY042T81 uses SSD1683 controller, 400x300 pixels
 #include <GxEPD2_BW.h>
-// #include <GxEPD2_420_GDEY042T81.h>
-// static GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>* display = nullptr;
-
-#include <Fonts/TomThumb.h>   // 5pt font from Adafruit GFX
 
 #include "buttons.h"
 #include "bookstate.h"
@@ -38,7 +33,7 @@
 #include "webserver.h"
 #include "ui.h"
 
-// ── Pin Definitions ──────────────────────────────────────────────────────
+// ── Pin Definitions ───────────────────────────────────────────────────────────────
 #define EPD_CS    5
 #define EPD_DC    3
 #define EPD_RST   2
@@ -51,11 +46,11 @@
 #define BTN_SELECT 21
 #define BTN_BACK   20
 
-// ── WiFi AP credentials ──────────────────────────────────────────────────
+// ── WiFi AP credentials ─────────────────────────────────────────────────────
 #define WIFI_SSID "eReader"
 #define WIFI_PASS "readbooks"
 
-// ── Global display object ────────────────────────────────────────────────
+// ── Global display object ─────────────────────────────────────────────────────
 GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
   display(GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 
@@ -70,7 +65,6 @@ void setup() {
     Serial.println("[FS] LittleFS mount FAILED");
   } else {
     Serial.println("[FS] Mounted OK");
-    // Ensure /books dir exists
     if (!LittleFS.exists("/books")) LittleFS.mkdir("/books");
   }
 
@@ -80,8 +74,9 @@ void setup() {
   // Display — custom SPI on C3
   SPI.begin(EPD_SCK, /*MISO*/-1, EPD_MOSI, EPD_CS);
   display.init(115200, true, 2, false);
-  display.setRotation(0);  // portrait: width=300, height=400
-  display.setFont(&TomThumb);
+  display.setRotation(1);  // landscape: width=400, height=300
+  display.setFont(nullptr);
+  display.setTextSize(1);
   display.setTextColor(GxEPD_BLACK);
   display.setFullWindow();
 
