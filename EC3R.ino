@@ -1,25 +1,8 @@
 /*
  * ESP32-C3 E-Paper eReader
  * WeActStudio GDEY042T81 4.2" 300x400 B/W
- *
- * ── Wiring ───────────────────────────────────────────────────────────────
- *   VCC→3V3, GND→GND
- *   DIN/MOSI → GPIO10 (D10)
- *   CLK/SCK  → GPIO8  (D8)
- *   CS       → GPIO5  (D3)
- *   DC       → GPIO3  (D1)
- *   RST      → GPIO2  (D0)
- *   BUSY     → GPIO4  (D2)
- *
- * ── Buttons (active-LOW, INPUT_PULLUP) ──────────────────────────────────
- *   NEXT   → GPIO6  (D4)
- *   PREV   → GPIO7  (D5)
- *   SELECT → GPIO21 (D6)
- *   BACK   → GPIO20 (D7)
  */
 
-// Give the Arduino loop() task 16 KB of stack instead of the default 8 KB.
-// Must be defined BEFORE any #include that pulls in the Arduino framework.
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 #include <Arduino.h>
@@ -36,7 +19,6 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include "webserver.h"
 #include "ui.h"
 
-// ── Pin Definitions ───────────────────────────────────────────────────────
 #define EPD_CS    5
 #define EPD_DC    3
 #define EPD_RST   2
@@ -58,26 +40,25 @@ GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
 AppState appState;
 
 // ---------------------------------------------------------------------------
-// runOnBigStack: run a void(*)(void*) on a temporary 24 KB FreeRTOS task and
-// block until it finishes.  Use this for any call that would overflow loopTask.
+// runOnBigStack: dispatch a job to a 48 KB FreeRTOS task and block until done.
+// Miniz inflate on RISC-V (ESP32-C3) needs ~36 KB of call-frame depth alone.
 // ---------------------------------------------------------------------------
 struct _BigStackJob { void (*fn)(void*); void* arg; volatile bool done; };
 
 static void _bigStackTrampoline(void* pv) {
-  auto* j = (struct _BigStackJob*)pv;
+  auto* j = (_BigStackJob*)pv;
   j->fn(j->arg);
   j->done = true;
   vTaskDelete(nullptr);
 }
 
 void runOnBigStack(void (*fn)(void*), void* arg) {
-  volatile struct _BigStackJob job = { fn, arg, false };
+  volatile _BigStackJob job = { fn, arg, false };
   xTaskCreate(_bigStackTrampoline, "bigStack",
-              24 * 1024,          // 24 KB stack
+              48 * 1024 / sizeof(StackType_t),  // 48 KB
               (void*)&job,
               tskIDLE_PRIORITY + 1,
               nullptr);
-  // Spin-wait; job runs concurrently but we don't touch display/state until done
   while (!job.done) delay(5);
 }
 
@@ -94,7 +75,7 @@ void setup() {
 
   buttonsInit(BTN_NEXT, BTN_PREV, BTN_SELECT, BTN_BACK);
 
-  SPI.begin(EPD_SCK, /*MISO*/-1, EPD_MOSI, EPD_CS);
+  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   display.init(115200, true, 2, false);
   display.setRotation(1);
   display.setFont(nullptr);

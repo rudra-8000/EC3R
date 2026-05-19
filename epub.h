@@ -1,8 +1,8 @@
 #pragma once
 /*
  * Minimal EPUB 2/3 parser.
- * ALL large objects (ZipFile, buffers) are static — nothing large on stack.
- * Not re-entrant, but fine for single-task embedded use.
+ * ALL large objects static — nothing large on stack.
+ * opf[] is 16 KB to handle large OPF files (e.g. long Gutenberg books).
  */
 #include <Arduino.h>
 #include "ZipFile.h"
@@ -18,12 +18,9 @@ struct EpubInfo {
   bool valid;
 };
 
-// ---- Static instances ---------------------------------------------------
-// mz_zip_archive is ~1.4KB; declaring ZipFile on the stack overflows 8KB loopTask.
-static ZipFile _epubZip;   // used in epubOpen
-static ZipFile _epubZip2;  // used for image extraction in sesLoadChapter
+static ZipFile _epubZip;
+static ZipFile _epubZip2;
 
-// ---- Attribute extractor ------------------------------------------------
 static bool _getAttr(const char* s, const char* attr, char* out, int outLen) {
   int alen = strlen(attr);
   const char* p = s;
@@ -82,7 +79,8 @@ inline bool epubOpen(const char* path, EpubInfo& info) {
   char* sl = strrchr(info.opfBase, '/');
   if (sl) *(sl + 1) = '\0'; else info.opfBase[0] = '\0';
 
-  static char opf[8192];
+  // 16 KB OPF buffer — large Gutenberg books have big OPF files
+  static char opf[16384];
   size_t opfLen = _epubZip.extractSmall(opfPath, opf, sizeof(opf) - 1);
   _epubZip.close();
   if (!opfLen) { Serial.println("[epub] OPF empty"); return false; }
@@ -149,7 +147,6 @@ inline bool epubOpen(const char* path, EpubInfo& info) {
   return info.valid;
 }
 
-// ---- HTML stripper -------------------------------------------------------
 static int stripHtml(const char* html, int len,
                      char* out, int outLen,
                      char* imgSrc, int imgSrcLen) {
@@ -158,34 +155,33 @@ static int stripHtml(const char* html, int len,
   bool gotImg = false;
   static char tag[256];
 
-  // HTML entity table — every entry is exactly one char
   static const char* const es[] = {
-    "&amp;", "&lt;", "&gt;", "&nbsp;", "&#160;",
-    "&apos;", "&quot;", "&mdash;", "&ndash;",
-    "&ldquo;", "&rdquo;", "&lsquo;", "&rsquo;"
+    "&amp;","&lt;","&gt;","&nbsp;","&#160;",
+    "&apos;","&quot;","&mdash;","&ndash;",
+    "&ldquo;","&rdquo;","&lsquo;","&rsquo;"
   };
   static const char ec[] = {
-    '&', '<', '>', ' ', ' ',
-    '\'', '"', '-', '-',
-    '"', '"', '\'', '\''
+    '&','<','>',' ',' ',
+    '\'','"','-','-',
+    '"','"','\'','\''
   };
 
   while (p < end && oi < outLen - 1) {
     if (!inTag) {
       if (*p == '<') {
         inTag = true;
-        if (!gotImg && imgSrc && p + 4 < end && strncasecmp(p+1,"img ",4)==0) {
-          const char* te = strchr(p, '>');
+        if (!gotImg && imgSrc && p+4 < end && strncasecmp(p+1,"img ",4)==0) {
+          const char* te = strchr(p,'>');
           if (te) {
-            int tl = (int)(te-p); if(tl>255)tl=255;
+            int tl=(int)(te-p); if(tl>255)tl=255;
             strncpy(tag,p,tl); tag[tl]='\0';
             if(_getAttr(tag,"src",imgSrc,imgSrcLen)) gotImg=true;
           }
         }
-        if (p + 2 < end) {
+        if (p+2 < end) {
           const char* blk[]={"p ","p>","br","h1","h2","h3",
                               "h4","h5","h6","li","/p","tr"};
-          for (int bi=0;bi<12;bi++)
+          for(int bi=0;bi<12;bi++)
             if(strncasecmp(p+1,blk[bi],2)==0){
               if(oi>0&&out[oi-1]!='\n') out[oi++]='\n';
               break;
