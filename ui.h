@@ -3,8 +3,7 @@
  * UI rendering — word-wrap text, image display, menu, reading mode.
  *
  * Display: portrait 300 × 400
- * Font: TomThumb — 5×7 pixels, ~6px wide × 8px tall with spacing
- *   → ~48 chars/line, ~48 text lines per page (1 line reserved for status)
+ * Font: GxEPD2 built-in (NULL / default) — 6×8 px, ~50 chars/line, ~46 lines
  *
  * Page-turn is O(n) text scan, no full document buffering.
  * A ring cache of PAGE_CACHE page-start offsets enables PREV without rescanning.
@@ -13,22 +12,21 @@
 #include <Arduino.h>
 #include <GxEPD2_BW.h>
 #include <GxEPD2_420_GDEY042T81.h>
-#include <Fonts/TomThumb.h>
 #include <TJpg_Decoder.h>
 #include "bookstate.h"
 #include "epub.h"
 #include "buttons.h"
 
-#define DISP_W   300
-#define DISP_H   400
-#define FONT_W   6
-#define FONT_H   8
-#define MARGIN_X 3
-#define MARGIN_Y 7
-#define COLS     ((DISP_W - 2*MARGIN_X) / FONT_W)
-#define ROWS     ((DISP_H - MARGIN_Y - 6) / FONT_H)
-#define TEXT_ROWS (ROWS - 1)
-#define MENU_VIS 12
+// Built-in font metrics (Adafruit GFX default 6x8)
+#define DISP_W    300
+#define DISP_H    400
+#define FONT_W    6      // pixels per char
+#define FONT_H    8      // pixels per line (matches textsize=1)
+#define MARGIN_X  2
+#define MARGIN_Y  8      // first baseline
+#define COLS      ((DISP_W - 2*MARGIN_X) / FONT_W)   // 49 chars
+#define TEXT_ROWS ((DISP_H - MARGIN_Y - FONT_H - 2) / FONT_H)  // ~47 lines (leave 1 for status)
+#define MENU_VIS  18     // more items visible with larger font
 #define PAGE_CACHE 10
 
 typedef GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> Disp;
@@ -63,14 +61,16 @@ static void sesFree() {
 // ── Text page renderer ────────────────────────────────────────────────────
 static int renderTextPage(Disp& d, const char* buf, int bufLen,
                            int startOff, int pageNum, const char* title) {
-  d.setFont(&TomThumb);
+  d.setFont(nullptr);           // built-in 6x8
+  d.setTextSize(1);
   d.setTextColor(GxEPD_BLACK);
   d.fillScreen(GxEPD_WHITE);
 
-  char status[56];
+  // Status bar at bottom
   char t[22]; strncpy(t, title, 21); t[21] = '\0';
-  snprintf(status, sizeof(status), "%-21s  p%d", t, pageNum + 1);
-  d.setCursor(MARGIN_X, DISP_H - 2);
+  char status[56];
+  snprintf(status, sizeof(status), "%-21s p%d", t, pageNum + 1);
+  d.setCursor(MARGIN_X, DISP_H - FONT_H - 1);
   d.print(status);
 
   int row = 0, col = 0, i = startOff;
@@ -162,8 +162,8 @@ static void renderImagePage(Disp& d, const uint8_t* jpgBuf, size_t jpgLen,
   TJpgDec.setCallback(_jpgCb);
   TJpgDec.setJpgScale(scale);
   TJpgDec.drawJpg(0, 0, jpgBuf, jpgLen);
-  d.setFont(&TomThumb); d.setTextColor(GxEPD_BLACK);
-  d.setCursor(MARGIN_X, DISP_H - 2);
+  d.setFont(nullptr); d.setTextSize(1); d.setTextColor(GxEPD_BLACK);
+  d.setCursor(MARGIN_X, DISP_H - FONT_H - 1);
   d.print(title);
 }
 
@@ -184,7 +184,6 @@ static bool sesLoadChapter(int ci) {
   _ses.textLen = stripHtml(html, (int)hLen, _ses.textBuf, (int)hLen + 1,
                             imgSrc, MAX_HREF_LEN);
   free(html);
-  // Collapse whitespace
   char* p = _ses.textBuf, *q = _ses.textBuf;
   bool ls = false;
   while (*p) {
@@ -194,7 +193,6 @@ static bool sesLoadChapter(int ci) {
   }
   *q = '\0'; _ses.textLen = q - _ses.textBuf;
   _ses.hasText = (_ses.textLen > 4);
-  // Image-only chapter
   if (strlen(imgSrc) > 0 && _ses.textLen < 60) {
     char ipath[MAX_PATH_LEN + MAX_HREF_LEN];
     snprintf(ipath, sizeof(ipath), "%s%s", _ses.info.opfBase, imgSrc);
@@ -235,9 +233,11 @@ static void sesRender(Disp& d) {
     d.setFullWindow(); d.firstPage();
     do {
       d.fillScreen(GxEPD_WHITE);
-      d.setFont(&TomThumb); d.setTextColor(GxEPD_BLACK);
+      d.setFont(nullptr); d.setTextSize(1); d.setTextColor(GxEPD_BLACK);
       d.setCursor(MARGIN_X, DISP_H / 2);
-      d.print("[empty section - press NEXT]");
+      d.print("[empty section]");
+      d.setCursor(MARGIN_X, DISP_H / 2 + FONT_H + 2);
+      d.print("Press NEXT to continue");
     } while (d.nextPage());
     return;
   }
@@ -251,14 +251,13 @@ static void sesRender(Disp& d) {
 }
 
 // ── Helper: advance to next chapter ──────────────────────────────────────
-// Returns false if end-of-book (caller should show end screen and return).
 static bool sesAdvanceChapter(Disp& d) {
   _ses.chIdx++;
   if (_ses.chIdx >= _ses.info.chapterCount) {
     d.setFullWindow(); d.firstPage();
     do {
       d.fillScreen(GxEPD_WHITE);
-      d.setFont(&TomThumb); d.setTextColor(GxEPD_BLACK);
+      d.setFont(nullptr); d.setTextSize(1); d.setTextColor(GxEPD_BLACK);
       d.setCursor(MARGIN_X, DISP_H / 2 - FONT_H);
       d.print("--- End of book ---");
       d.setCursor(MARGIN_X, DISP_H / 2 + 2);
@@ -274,46 +273,44 @@ static bool sesAdvanceChapter(Disp& d) {
 
 // ── uiDrawMenu ────────────────────────────────────────────────────────────
 void uiDrawMenu(Disp& d, const AppState& s) {
-  d.setFullWindow();
-  d.firstPage();
+  d.setFullWindow(); d.firstPage();
   do {
     d.fillScreen(GxEPD_WHITE);
-    d.setFont(&TomThumb);
-    d.setTextColor(GxEPD_BLACK);
-    d.fillRect(0, 0, DISP_W, FONT_H + 2, GxEPD_BLACK);
+    d.setFont(nullptr); d.setTextSize(1); d.setTextColor(GxEPD_BLACK);
+
+    // Title bar
+    d.fillRect(0, 0, DISP_W, FONT_H + 3, GxEPD_BLACK);
     d.setTextColor(GxEPD_WHITE);
-    d.setCursor(MARGIN_X, FONT_H);
-    d.print("eReader  [SEL=open BCK=wifi]");
+    d.setCursor(MARGIN_X, 2); d.print("eReader  SEL=open BCK=wifi");
     d.setTextColor(GxEPD_BLACK);
+
     if (s.bookCount == 0) {
-      d.setCursor(MARGIN_X, FONT_H * 4);
-      d.print("No books found.");
-      d.setCursor(MARGIN_X, FONT_H * 5 + 2);
-      d.print("Upload EPUBs via WiFi.");
-      d.setCursor(MARGIN_X, FONT_H * 6 + 4);
-      d.print("SSID: eReader  PW: readbooks");
-      d.setCursor(MARGIN_X, FONT_H * 7 + 6);
-      d.print("http://192.168.4.1");
+      d.setCursor(MARGIN_X, FONT_H * 3); d.print("No books found.");
+      d.setCursor(MARGIN_X, FONT_H * 4 + 2); d.print("Upload EPUBs via WiFi:");
+      d.setCursor(MARGIN_X, FONT_H * 5 + 4); d.print("SSID: eReader");
+      d.setCursor(MARGIN_X, FONT_H * 6 + 4); d.print("Pass: readbooks");
+      d.setCursor(MARGIN_X, FONT_H * 7 + 6); d.print("http://192.168.4.1");
     } else {
+      int lineH = FONT_H + 2;
       for (int i = 0; i < MENU_VIS && (s.menuScroll + i) < s.bookCount; i++) {
         int bi = s.menuScroll + i;
-        int y  = FONT_H + 4 + i * (FONT_H + 1);
+        int y  = FONT_H + 4 + i * lineH;
         if (bi == s.menuIndex) {
-          d.fillRect(0, y - FONT_H + 1, DISP_W, FONT_H + 1, GxEPD_BLACK);
+          d.fillRect(0, y - 1, DISP_W, lineH, GxEPD_BLACK);
           d.setTextColor(GxEPD_WHITE);
         } else {
           d.setTextColor(GxEPD_BLACK);
         }
-        d.setCursor(MARGIN_X, y);
+        d.setCursor(MARGIN_X, y + FONT_H - 2);
         const char* fname = s.books[bi];
         const char* slash = strrchr(fname, '/');
         if (slash) fname = slash + 1;
-        char dname[48];
-        strncpy(dname, fname, 47); dname[47] = '\0';
+        char dname[50];
+        strncpy(dname, fname, 49); dname[49] = '\0';
         char* dot = strrchr(dname, '.');
         if (dot) *dot = '\0';
         if (s.openBookIdx == bi) {
-          char marked[52];
+          char marked[54];
           snprintf(marked, sizeof(marked), ">%s", dname);
           d.print(marked);
         } else {
@@ -322,10 +319,11 @@ void uiDrawMenu(Disp& d, const AppState& s) {
         d.setTextColor(GxEPD_BLACK);
       }
       if (s.menuScroll > 0) {
-        d.setCursor(DISP_W - 10, FONT_H + 4); d.print("^");
+        d.setCursor(DISP_W - FONT_W * 2, FONT_H + 4); d.print("^");
       }
       if (s.menuScroll + MENU_VIS < s.bookCount) {
-        d.setCursor(DISP_W - 10, FONT_H + 4 + (MENU_VIS - 1) * (FONT_H + 1)); d.print("v");
+        d.setCursor(DISP_W - FONT_W * 2, FONT_H + 4 + (MENU_VIS - 1) * (FONT_H + 2));
+        d.print("v");
       }
     }
   } while (d.nextPage());
@@ -336,17 +334,17 @@ void uiDrawWifiInfo(Disp& d) {
   d.setFullWindow(); d.firstPage();
   do {
     d.fillScreen(GxEPD_WHITE);
-    d.setFont(&TomThumb); d.setTextColor(GxEPD_BLACK);
-    d.fillRect(0, 0, DISP_W, FONT_H + 2, GxEPD_BLACK);
+    d.setFont(nullptr); d.setTextSize(1); d.setTextColor(GxEPD_BLACK);
+    d.fillRect(0, 0, DISP_W, FONT_H + 3, GxEPD_BLACK);
     d.setTextColor(GxEPD_WHITE);
-    d.setCursor(MARGIN_X, FONT_H); d.print("WiFi File Manager");
+    d.setCursor(MARGIN_X, 2); d.print("WiFi File Manager");
     d.setTextColor(GxEPD_BLACK);
     int y = FONT_H * 3;
-    d.setCursor(MARGIN_X, y); y += FONT_H + 2; d.print("SSID : eReader");
-    d.setCursor(MARGIN_X, y); y += FONT_H + 2; d.print("Pass : readbooks");
-    d.setCursor(MARGIN_X, y); y += FONT_H + 4; d.print("URL  : http://192.168.4.1");
-    d.setCursor(MARGIN_X, y); y += FONT_H + 2; d.print("Upload .epub, then reboot.");
-    d.setCursor(MARGIN_X, y);                   d.print("[BACK] return to menu");
+    d.setCursor(MARGIN_X, y); y += FONT_H + 4; d.print("SSID : eReader");
+    d.setCursor(MARGIN_X, y); y += FONT_H + 4; d.print("Pass : readbooks");
+    d.setCursor(MARGIN_X, y); y += FONT_H + 6; d.print("URL  : http://192.168.4.1");
+    d.setCursor(MARGIN_X, y); y += FONT_H + 4; d.print("Upload .epub then reboot");
+    d.setCursor(MARGIN_X, y);                   d.print("BACK/SEL = return to menu");
   } while (d.nextPage());
 }
 
@@ -366,7 +364,7 @@ void uiOpenBook(Disp& d, AppState& s) {
   d.setFullWindow(); d.firstPage();
   do {
     d.fillScreen(GxEPD_WHITE);
-    d.setFont(&TomThumb); d.setTextColor(GxEPD_BLACK);
+    d.setFont(nullptr); d.setTextSize(1); d.setTextColor(GxEPD_BLACK);
     d.setCursor(MARGIN_X, DISP_H / 2 - FONT_H); d.print("Opening...");
     d.setCursor(MARGIN_X, DISP_H / 2 + 2);       d.print(_ses.title);
   } while (d.nextPage());
@@ -377,9 +375,9 @@ void uiOpenBook(Disp& d, AppState& s) {
     d.setFullWindow(); d.firstPage();
     do {
       d.fillScreen(GxEPD_WHITE);
-      d.setFont(&TomThumb); d.setTextColor(GxEPD_BLACK);
-      d.setCursor(MARGIN_X, DISP_H / 2);           d.print("Failed to open EPUB.");
-      d.setCursor(MARGIN_X, DISP_H / 2 + FONT_H + 2); d.print("[BACK] to menu");
+      d.setFont(nullptr); d.setTextSize(1); d.setTextColor(GxEPD_BLACK);
+      d.setCursor(MARGIN_X, DISP_H / 2);                d.print("Failed to open EPUB.");
+      d.setCursor(MARGIN_X, DISP_H / 2 + FONT_H + 2);  d.print("[BACK] to menu");
     } while (d.nextPage());
     s.mode = MODE_MENU;
     return;
@@ -444,13 +442,10 @@ void handleReadingInput(Disp& d, AppState& s, ButtonEvent ev) {
   if (ev == BTN_EVT_NONE) return;
 
   if (ev == BTN_EVT_NEXT) {
-    // Determine whether we need to advance the chapter or the page.
-    // Evaluate newOff unconditionally first (no goto needed).
     long newOff = _ses._nextOff;
     bool needNextChapter = _ses.isImg || !_ses.hasText || (newOff >= _ses.textLen);
-
     if (needNextChapter) {
-      if (!sesAdvanceChapter(d)) return;  // end-of-book screen shown inside
+      if (!sesAdvanceChapter(d)) return;
     } else {
       sesCachePush(newOff);
       _ses.byteOff = newOff;
