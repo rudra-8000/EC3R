@@ -12,7 +12,7 @@
 
 #include <Arduino.h>
 #include <GxEPD2_BW.h>
-#include <GxEPD2_420_GDEY042T81.h>
+// #include <GxEPD2_420_GDEY042T81.h>
 #include <Fonts/TomThumb.h>
 #include <TJpg_Decoder.h>
 #include "bookstate.h"
