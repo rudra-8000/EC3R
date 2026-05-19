@@ -3,6 +3,9 @@
  * UI rendering — word-wrap text, image display, menu, reading mode.
  * Display: landscape 400×300 (setRotation(1))
  * Font: built-in nullptr, 6×8px. setCursor(x,y) = TOP-LEFT of char.
+ *
+ * epubOpen() and sesLoadChapter() are called via runOnBigStack() so they
+ * run with 24 KB of stack and never overflow the 16 KB loopTask.
  */
 
 #include <Arduino.h>
@@ -12,6 +15,9 @@
 #include "bookstate.h"
 #include "epub.h"
 #include "buttons.h"
+
+// Declared in EC3R.ino, used here
+extern void runOnBigStack(void (*fn)(void*), void* arg);
 
 #define DISP_W      400
 #define DISP_H      300
@@ -44,6 +50,7 @@ struct ReaderSession {
   char     title[48];
   char     epubPath[96];
   int      _nextOff;
+  bool     loadOk;    // result flag set by big-stack jobs
 };
 
 static ReaderSession _ses;
@@ -135,21 +142,26 @@ static void renderImagePage(Disp& d,const uint8_t* buf,size_t len,const char* ti
   d.setCursor(MARGIN_X,DISP_H-LINE_H+1);d.print(title);
 }
 
-// ---- Chapter loader (uses static ZipFile from epub.h) --------------------
-static bool sesLoadChapter(int ci) {
-  sesFree(); _ses.hasText=false; _ses.isImg=false;
-  // _epubZip is the static ZipFile in epub.h
-  if(!_epubZip.open(_ses.epubPath)) return false;
+// ---- Chapter loader (runs on big stack via runOnBigStack) ----------------
+static void _doLoadChapter(void* /*unused*/) {
+  // 'ci' is stored in _ses.chIdx before calling this
+  int ci = _ses.chIdx;
+  sesFree(); _ses.hasText=false; _ses.isImg=false; _ses.loadOk=false;
+
+  if(!_epubZip.open(_ses.epubPath)){return;}
   const char* href=_ses.info.chapterHrefs[ci];
   char* html=nullptr;
   size_t hLen=_epubZip.extractToHeap(href,&html,32768);
   _epubZip.close();
-  if(!hLen||!html){if(html)free(html);return false;}
+  if(!hLen||!html){if(html)free(html);return;}
+
   _ses.textBuf=(char*)malloc(hLen+1);
-  if(!_ses.textBuf){free(html);return false;}
+  if(!_ses.textBuf){free(html);return;}
+
   static char imgSrc[MAX_HREF_LEN]; imgSrc[0]='\0';
   _ses.textLen=stripHtml(html,(int)hLen,_ses.textBuf,(int)hLen+1,imgSrc,MAX_HREF_LEN);
   free(html);
+
   // Collapse whitespace
   char*p=_ses.textBuf,*q=_ses.textBuf; bool ls=false;
   while(*p){
@@ -159,6 +171,7 @@ static bool sesLoadChapter(int ci) {
   }
   *q='\0';_ses.textLen=q-_ses.textBuf;
   _ses.hasText=(_ses.textLen>4);
+
   if(strlen(imgSrc)>0&&_ses.textLen<60){
     static char ipath[MAX_PATH_LEN+MAX_HREF_LEN];
     snprintf(ipath,sizeof(ipath),"%s%s",_ses.info.opfBase,imgSrc);
@@ -168,7 +181,18 @@ static bool sesLoadChapter(int ci) {
       if(il&&ib){_ses.imgBuf=(uint8_t*)ib;_ses.imgLen=il;_ses.isImg=true;_ses.hasText=false;}
     }
   }
-  return true;
+  _ses.loadOk=true;
+}
+
+static bool sesLoadChapter(int ci) {
+  _ses.chIdx=ci;
+  runOnBigStack(_doLoadChapter, nullptr);
+  return _ses.loadOk;
+}
+
+// ---- epubOpen on big stack -----------------------------------------------
+static void _doEpubOpen(void* /*unused*/) {
+  _ses.loadOk = epubOpen(_ses.epubPath, _ses.info);
 }
 
 static void sesCachePush(long o){
@@ -298,6 +322,7 @@ void uiOpenBook(Disp& d, AppState& s){
   snprintf(_ses.epubPath,sizeof(_ses.epubPath),"/books/%s",fname);
   Serial.printf("[Book] Opening: %s\n",_ses.epubPath);
 
+  // Show "Opening..." splash
   d.setFullWindow();d.firstPage();
   do{
     d.fillScreen(GxEPD_WHITE);
@@ -306,7 +331,10 @@ void uiOpenBook(Disp& d, AppState& s){
     d.setCursor(MARGIN_X,DISP_H/2);       d.print(_ses.title);
   }while(d.nextPage());
 
-  if(!epubOpen(_ses.epubPath,_ses.info)){
+  // Parse EPUB on big stack
+  runOnBigStack(_doEpubOpen, nullptr);
+
+  if(!_ses.loadOk){
     Serial.println("[Book] epubOpen failed");
     d.setFullWindow();d.firstPage();
     do{
@@ -322,12 +350,14 @@ void uiOpenBook(Disp& d, AppState& s){
   _ses.byteOff=s.progress.byteOffset;
   _ses.pageNum=s.progress.pageInChapter;
   if(_ses.chIdx>=_ses.info.chapterCount){_ses.chIdx=0;_ses.byteOff=0;_ses.pageNum=0;}
+
+  // Load first chapter on big stack
   sesLoadChapter(_ses.chIdx);
   _ses.pageCache[0]=_ses.byteOff;_ses.cCount=1;_ses.cHead=0;
   sesRender(d);
 }
 
-// ---- handleMenuInput -----------------------------------------------------
+// ---- Input handlers ------------------------------------------------------
 void handleMenuInput(Disp& d, AppState& s, ButtonEvent ev){
   if(ev==BTN_EVT_NONE)return;
   bool redraw=false;
