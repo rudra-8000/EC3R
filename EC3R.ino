@@ -1,16 +1,12 @@
-/*
- * ESP32-C3 E-Paper eReader
- * WeActStudio GDEY042T81 4.2" 300x400 B/W
- */
-
-SET_LOOP_TASK_STACK_SIZE(16 * 1024);
-
 #include <Arduino.h>
+SET_LOOP_TASK_STACK_SIZE(24 * 1024);
+
 #include <SPI.h>
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
 #include <GxEPD2_BW.h>
+#include <esp_heap_caps.h>
 
 #include "buttons.h"
 #include "bookstate.h"
@@ -19,17 +15,19 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include "webserver.h"
 #include "ui.h"
 
-#define EPD_CS    5
-#define EPD_DC    3
-#define EPD_RST   2
-#define EPD_BUSY  4
-#define EPD_MOSI  10
-#define EPD_SCK   8
+// ── Pin Definitions ───────────────────────────────────────────────────────
+#define EPD_MOSI  11
+#define EPD_SCK   12
+#define EPD_MISO  13   // not used by display but needed for SPI init
+#define EPD_CS    10
+#define EPD_DC     9
+#define EPD_RST    3
+#define EPD_BUSY  46
 
-#define BTN_NEXT   6
-#define BTN_PREV   7
-#define BTN_SELECT 21
-#define BTN_BACK   20
+#define BTN_NEXT    4
+#define BTN_PREV    5
+#define BTN_SELECT  6
+#define BTN_BACK    7
 
 #define WIFI_SSID "eReader"
 #define WIFI_PASS "readbooks"
@@ -39,32 +37,65 @@ GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
 
 AppState appState;
 
-// ---------------------------------------------------------------------------
-// runOnBigStack: dispatch a job to a 48 KB FreeRTOS task and block until done.
-// Miniz inflate on RISC-V (ESP32-C3) needs ~36 KB of call-frame depth alone.
-// ---------------------------------------------------------------------------
-struct _BigStackJob { void (*fn)(void*); void* arg; volatile bool done; };
+// -------------------------------------------------------------------------
+// Run heavy work on the other core with a fat stack.
+// Arduino loop runs on one core by default; this worker handles EPUB parsing.
+// -------------------------------------------------------------------------
+struct PinnedJob {
+  void (*fn)(void*);
+  void* arg;
+  SemaphoreHandle_t done;
+};
 
-static void _bigStackTrampoline(void* pv) {
-  auto* j = (_BigStackJob*)pv;
-  j->fn(j->arg);
-  j->done = true;
+static void _pinnedJobTask(void* pv) {
+  PinnedJob* job = (PinnedJob*)pv;
+  job->fn(job->arg);
+  xSemaphoreGive(job->done);
   vTaskDelete(nullptr);
 }
 
-void runOnBigStack(void (*fn)(void*), void* arg) {
-  volatile _BigStackJob job = { fn, arg, false };
-  xTaskCreate(_bigStackTrampoline, "bigStack",
-              48 * 1024 / sizeof(StackType_t),  // 48 KB
-              (void*)&job,
-              tskIDLE_PRIORITY + 1,
-              nullptr);
-  while (!job.done) delay(5);
+bool runPinnedJob(void (*fn)(void*), void* arg, BaseType_t core, uint32_t stackBytes) {
+  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+  if (!done) return false;
+
+  PinnedJob job { fn, arg, done };
+
+  BaseType_t ok = xTaskCreatePinnedToCore(
+    _pinnedJobTask,
+    "epubWorker",
+    stackBytes / sizeof(StackType_t),
+    &job,
+    2,
+    nullptr,
+    core
+  );
+
+  if (ok != pdPASS) {
+    vSemaphoreDelete(done);
+    return false;
+  }
+
+  xSemaphoreTake(done, portMAX_DELAY);
+  vSemaphoreDelete(done);
+  return true;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(400);
+  delay(300);
+
+  Serial.printf("[SYS] chip=%s cores=%d cpu=%dMHz\n",
+                ESP.getChipModel(),
+                ESP.getChipCores(),
+                ESP.getCpuFreqMHz());
+
+  if (psramFound()) {
+    Serial.printf("[SYS] PSRAM OK total=%u free=%u\n",
+                  ESP.getPsramSize(),
+                  ESP.getFreePsram());
+  } else {
+    Serial.println("[SYS] PSRAM NOT FOUND");
+  }
 
   if (!LittleFS.begin(true)) {
     Serial.println("[FS] LittleFS mount FAILED");
@@ -97,10 +128,18 @@ void setup() {
 
 void loop() {
   ButtonEvent ev = buttonsRead();
+
   switch (appState.mode) {
-    case MODE_MENU:      handleMenuInput(display, appState, ev);     break;
-    case MODE_READING:   handleReadingInput(display, appState, ev);  break;
-    case MODE_WIFI_INFO: handleWifiInfoInput(display, appState, ev); break;
+    case MODE_MENU:
+      handleMenuInput(display, appState, ev);
+      break;
+    case MODE_READING:
+      handleReadingInput(display, appState, ev);
+      break;
+    case MODE_WIFI_INFO:
+      handleWifiInfoInput(display, appState, ev);
+      break;
   }
-  delay(40);
+
+  delay(30);
 }
