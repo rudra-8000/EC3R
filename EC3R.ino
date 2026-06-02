@@ -1,6 +1,7 @@
-#include <Arduino.h>
+// SET_LOOP_TASK_STACK_SIZE must be the very first statement, before any #include
 SET_LOOP_TASK_STACK_SIZE(24 * 1024);
 
+#include <Arduino.h>
 #include <SPI.h>
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -18,7 +19,7 @@ SET_LOOP_TASK_STACK_SIZE(24 * 1024);
 // ── Pin Definitions ───────────────────────────────────────────────────────
 #define EPD_MOSI  11
 #define EPD_SCK   12
-#define EPD_MISO  13   // not used by display but needed for SPI init
+#define EPD_MISO  13
 #define EPD_CS    10
 #define EPD_DC     9
 #define EPD_RST    3
@@ -38,45 +39,62 @@ GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
 AppState appState;
 
 // -------------------------------------------------------------------------
-// Run heavy work on the other core with a fat stack.
-// Arduino loop runs on one core by default; this worker handles EPUB parsing.
+// PinnedJob: allocated on the HEAP so the pointer is valid for the lifetime
+// of the worker task. The calling task blocks on the semaphore; the worker
+// frees the job struct and signals done before deleting itself.
 // -------------------------------------------------------------------------
 struct PinnedJob {
   void (*fn)(void*);
-  void* arg;
+  void*             arg;
   SemaphoreHandle_t done;
 };
 
 static void _pinnedJobTask(void* pv) {
+  // pv points to a heap-allocated PinnedJob — safe to dereference any time.
   PinnedJob* job = (PinnedJob*)pv;
   job->fn(job->arg);
-  xSemaphoreGive(job->done);
+  xSemaphoreGive(job->done);   // unblock caller
+  // Do NOT free(job) here — caller frees after taking the semaphore.
   vTaskDelete(nullptr);
 }
 
+// Runs fn(arg) on `core` with `stackBytes` bytes of task stack.
+// Blocks until fn returns. Thread-safe via binary semaphore.
 bool runPinnedJob(void (*fn)(void*), void* arg, BaseType_t core, uint32_t stackBytes) {
-  SemaphoreHandle_t done = xSemaphoreCreateBinary();
-  if (!done) return false;
+  // Allocate job on heap so the pointer is valid while the worker runs.
+  PinnedJob* job = (PinnedJob*)malloc(sizeof(PinnedJob));
+  if (!job) { Serial.println("[runPinnedJob] malloc failed"); return false; }
 
-  PinnedJob job { fn, arg, done };
+  job->fn   = fn;
+  job->arg  = arg;
+  job->done = xSemaphoreCreateBinary();
+  if (!job->done) { free(job); return false; }
+
+  // xTaskCreatePinnedToCore takes stack depth in WORDS (4 bytes each on S3)
+  const uint32_t stackWords = stackBytes / 4;
 
   BaseType_t ok = xTaskCreatePinnedToCore(
     _pinnedJobTask,
     "epubWorker",
-    stackBytes / sizeof(StackType_t),
-    &job,
-    2,
+    stackWords,
+    job,           // pointer to heap struct — stays valid
+    2,             // priority above idle, below Arduino loop (1)
     nullptr,
     core
   );
 
   if (ok != pdPASS) {
-    vSemaphoreDelete(done);
+    Serial.printf("[runPinnedJob] xTaskCreate failed (stack=%u words, free heap=%u)\n",
+                  stackWords, ESP.getFreeHeap());
+    vSemaphoreDelete(job->done);
+    free(job);
     return false;
   }
 
-  xSemaphoreTake(done, portMAX_DELAY);
-  vSemaphoreDelete(done);
+  // Block until worker signals done
+  xSemaphoreTake(job->done, portMAX_DELAY);
+  vSemaphoreDelete(job->done);
+  free(job);
   return true;
 }
 
@@ -85,14 +103,13 @@ void setup() {
   delay(300);
 
   Serial.printf("[SYS] chip=%s cores=%d cpu=%dMHz\n",
-                ESP.getChipModel(),
-                ESP.getChipCores(),
-                ESP.getCpuFreqMHz());
+                ESP.getChipModel(), ESP.getChipCores(), ESP.getCpuFreqMHz());
+  Serial.printf("[SYS] free heap=%u largest block=%u\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   if (psramFound()) {
     Serial.printf("[SYS] PSRAM OK total=%u free=%u\n",
-                  ESP.getPsramSize(),
-                  ESP.getFreePsram());
+                  ESP.getPsramSize(), ESP.getFreePsram());
   } else {
     Serial.println("[SYS] PSRAM NOT FOUND");
   }
@@ -128,18 +145,10 @@ void setup() {
 
 void loop() {
   ButtonEvent ev = buttonsRead();
-
   switch (appState.mode) {
-    case MODE_MENU:
-      handleMenuInput(display, appState, ev);
-      break;
-    case MODE_READING:
-      handleReadingInput(display, appState, ev);
-      break;
-    case MODE_WIFI_INFO:
-      handleWifiInfoInput(display, appState, ev);
-      break;
+    case MODE_MENU:      handleMenuInput(display, appState, ev);     break;
+    case MODE_READING:   handleReadingInput(display, appState, ev);  break;
+    case MODE_WIFI_INFO: handleWifiInfoInput(display, appState, ev); break;
   }
-
   delay(30);
 }
